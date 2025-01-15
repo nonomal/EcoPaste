@@ -1,9 +1,10 @@
-import type { ClipboardItem } from "@/types/database";
-import type { ClipboardPayload, ReadImage, WinOCR } from "@/types/plugin";
+import type { HistoryTablePayload } from "@/types/database";
+import type { ClipboardPayload, ReadImage, WindowsOCR } from "@/types/plugin";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { exists } from "@tauri-apps/plugin-fs";
 import { isEmpty, isEqual } from "lodash-es";
+import { fullName, metadata } from "tauri-plugin-fs-pro-api";
 
 /**
  * 开启监听
@@ -98,7 +99,7 @@ export const readImage = async (): Promise<ClipboardPayload> => {
 	const { image, ...rest } = await invoke<ReadImage>(
 		CLIPBOARD_PLUGIN.READ_IMAGE,
 		{
-			dir: getSaveImageDir(),
+			path: getSaveImagePath(),
 		},
 	);
 
@@ -110,7 +111,7 @@ export const readImage = async (): Promise<ClipboardPayload> => {
 		search = await systemOCR(image);
 
 		if (isWin()) {
-			const { content, qr } = JSON.parse(search) as WinOCR;
+			const { content, qr } = JSON.parse(search) as WindowsOCR;
 
 			if (isEmpty(qr)) {
 				search = content;
@@ -120,7 +121,7 @@ export const readImage = async (): Promise<ClipboardPayload> => {
 		}
 	}
 
-	const value = image.replace(getSaveImageDir(), "");
+	const value = await fullName(image);
 
 	return {
 		...rest,
@@ -179,47 +180,6 @@ export const readText = async (): Promise<ClipboardPayload> => {
 	data.subtype = await getClipboardSubtype(data);
 
 	return data;
-};
-
-/**
- * 读取剪贴板内容
- */
-export const readClipboard = async () => {
-	let payload!: ClipboardPayload;
-
-	const { copyPlain } = clipboardStore.content;
-
-	const has = {
-		files: await hasFiles(),
-		image: await hasImage(),
-		html: await hasHTML(),
-		rtf: await hasRTF(),
-		text: await hasText(),
-	};
-
-	if (has.files) {
-		const filesPayload = await readFiles();
-
-		payload = { ...filesPayload, type: "files" };
-	} else if (has.image && !has.text) {
-		const imagePayload = await readImage();
-
-		payload = { ...imagePayload, type: "image" };
-	} else if (!copyPlain && has.html) {
-		const htmlPayload = await readHTML();
-
-		payload = { ...htmlPayload, type: "html" };
-	} else if (!copyPlain && has.rtf) {
-		const rtfPayload = await readRTF();
-
-		payload = { ...rtfPayload, type: "rtf" };
-	} else {
-		const textPayload = await readText();
-
-		payload = { ...textPayload, type: "text" };
-	}
-
-	return payload;
 };
 
 /**
@@ -282,36 +242,78 @@ export const writeText = (value: string) => {
 };
 
 /**
+ * 读取剪贴板内容
+ */
+export const readClipboard = async () => {
+	let payload!: ClipboardPayload;
+
+	const { copyPlain } = clipboardStore.content;
+
+	const has = {
+		files: await hasFiles(),
+		image: await hasImage(),
+		html: await hasHTML(),
+		rtf: await hasRTF(),
+		text: await hasText(),
+	};
+
+	if (has.files) {
+		const filesPayload = await readFiles();
+
+		payload = { ...filesPayload, type: "files" };
+	} else if (has.image && !has.text) {
+		const imagePayload = await readImage();
+
+		payload = { ...imagePayload, type: "image" };
+	} else if (!copyPlain && has.html) {
+		const htmlPayload = await readHTML();
+
+		payload = { ...htmlPayload, type: "html" };
+	} else if (!copyPlain && has.rtf) {
+		const rtfPayload = await readRTF();
+
+		payload = { ...rtfPayload, type: "rtf" };
+	} else {
+		const textPayload = await readText();
+
+		payload = { ...textPayload, type: "text" };
+	}
+
+	return payload;
+};
+
+/**
  * 剪贴板更新
  */
-export const onClipboardUpdate = (
-	fn: (payload: ClipboardPayload, oldPayload: ClipboardPayload) => void,
-) => {
-	// 防抖间隔（ms）
-	const DEBOUNCE = 200;
-	let lastUpdatedAt = 0;
-	let oldPayload: ClipboardPayload;
+export const onClipboardUpdate = (fn: (payload: ClipboardPayload) => void) => {
+	let lastUpdated = 0;
+	let previousPayload: ClipboardPayload;
 
 	return listen(CLIPBOARD_PLUGIN.CLIPBOARD_UPDATE, async () => {
 		const payload = await readClipboard();
 
-		if (
-			Date.now() - lastUpdatedAt > DEBOUNCE ||
-			!isEqual(payload, oldPayload)
-		) {
-			fn(payload, { ...oldPayload });
+		const { group, count } = payload;
+
+		if (group === "text" && count === 0) {
+			return;
 		}
 
-		lastUpdatedAt = Date.now();
-		oldPayload = payload;
+		const expired = Date.now() - lastUpdated > 200;
+
+		if (expired || !isEqual(payload, previousPayload)) {
+			fn(payload);
+		}
+
+		lastUpdated = Date.now();
+		previousPayload = payload;
 	});
 };
 
 /**
- * 将数据写入剪切板
+ * 将数据写入剪贴板
  * @param data 数据
  */
-export const writeClipboard = (data?: ClipboardItem) => {
+export const writeClipboard = (data?: HistoryTablePayload) => {
 	if (!data) return;
 
 	const { type, value, search } = data;
@@ -324,18 +326,21 @@ export const writeClipboard = (data?: ClipboardItem) => {
 		case "html":
 			return writeHTML(search, value);
 		case "image":
-			return writeImage(getSaveImagePath(value));
+			return writeImage(resolveImagePath(value));
 		case "files":
 			return writeFiles(value);
 	}
 };
 
 /**
- * 粘贴剪切板数据
+ * 粘贴剪贴板数据
  * @param data 数据
  * @param plain 是否纯文本粘贴
  */
-export const pasteClipboard = async (data?: ClipboardItem, plain = false) => {
+export const pasteClipboard = async (
+	data?: HistoryTablePayload,
+	plain = false,
+) => {
 	if (!data) return;
 
 	const { type, value } = data;
@@ -356,23 +361,29 @@ export const pasteClipboard = async (data?: ClipboardItem, plain = false) => {
 };
 
 /**
- * 获取剪切板数据的子类型
+ * 获取剪贴板数据的子类型
  * @param data 剪贴板数据
  */
 export const getClipboardSubtype = async (data: ClipboardPayload) => {
-	const { value } = data;
+	try {
+		const { value } = data;
 
-	let subtype: ClipboardPayload["subtype"];
+		if (isURL(value)) {
+			return "url";
+		}
 
-	if (isURL(value)) {
-		subtype = "url";
-	} else if (isEmail(value)) {
-		subtype = "email";
-	} else if (isColor(value)) {
-		subtype = "color";
-	} else if (await exists(value)) {
-		subtype = "path";
+		if (isEmail(value)) {
+			return "email";
+		}
+
+		if (isColor(value)) {
+			return "color";
+		}
+
+		if (await exists(value)) {
+			return "path";
+		}
+	} catch {
+		return;
 	}
-
-	return subtype;
 };
