@@ -1,7 +1,6 @@
-import { listen } from "@tauri-apps/api/event";
+import type { Interval } from "@/types/shared";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { type Update, check } from "@tauri-apps/plugin-updater";
-import type { Timeout } from "ahooks/lib/useRequest/src/types";
 import { Flex, Modal, Typography, message } from "antd";
 import clsx from "clsx";
 import Markdown from "react-markdown";
@@ -18,39 +17,40 @@ interface State {
 	download: number;
 }
 
-let timer: Timeout;
-
 const UpdateApp = () => {
 	const { t } = useTranslation();
+	const timerRef = useRef<Interval>();
 	const state = useReactive<State>({ download: 0 });
 	const [messageApi, contextHolder] = message.useMessage();
 
-	useMount(() => {
-		// 监听更新事件
-		listen<boolean>(LISTEN_KEY.UPDATE_APP, () => {
-			checkUpdate(true);
+	// 监听自动更新配置变化
+	useImmediateKey(globalStore.update, "auto", (value) => {
+		clearInterval(timerRef.current);
 
-			messageApi.open({
-				key: UPDATE_MESSAGE_KEY,
-				type: "loading",
-				content: t("component.app_update.hints.checking_update"),
-				duration: 0,
-			});
+		if (!value) return;
+
+		checkUpdate();
+
+		timerRef.current = setInterval(checkUpdate, 1000 * 60 * 60 * 24);
+	});
+
+	// 监听参与测试版本配置变化
+	useImmediateKey(globalStore.update, "beta", (value) => {
+		if (!value) return;
+
+		checkUpdate();
+	});
+
+	// 监听更新事件
+	useTauriListen<boolean>(LISTEN_KEY.UPDATE_APP, () => {
+		checkUpdate(true);
+
+		messageApi.open({
+			key: UPDATE_MESSAGE_KEY,
+			type: "loading",
+			content: t("component.app_update.hints.checking_update"),
+			duration: 0,
 		});
-
-		// 监听自动更新配置变化
-		watchKey(globalStore.update, "auto", (value) => {
-			clearInterval(timer);
-
-			if (!value) return;
-
-			checkUpdate();
-
-			timer = setInterval(checkUpdate, 1000 * 60 * 60 * 24);
-		});
-
-		// 监听参与测试版本配置变化
-		watchKey(globalStore.update, "beta", () => checkUpdate());
 	});
 
 	// 确认按钮的文字
@@ -99,32 +99,23 @@ const UpdateApp = () => {
 					content: t("component.app_update.hints.latest_version"),
 				});
 			}
-		} catch (error: any) {
+		} catch (error) {
 			if (!showMessage) return;
 
 			messageApi.open({
 				key: UPDATE_MESSAGE_KEY,
 				type: "error",
-				content: error,
+				content: String(error),
 			});
 		}
 	};
 
 	// 替换更新日志里的内容
 	const replaceBody = (body: string) => {
-		return (
-			body
-				// 替换贡献者名称
-				.replace(
-					/(-.*?by.*?)@([^ ]+)/g,
-					"$1<a href='https://github.com/$2'><mark>@$2</mark></a>",
-				)
-				// 替换 pr 链接
-				.replace(
-					new RegExp(`(${GITHUB_ISSUES_LINK}/)(\\d+)`, "g"),
-					"[#$2]($1$2)",
-				)
-		);
+		return body
+			.split("\n")
+			.map((line) => line.replace(/\s*-\s+by\s+@.*/, ""))
+			.join("\n");
 	};
 
 	const handleOk = async () => {
